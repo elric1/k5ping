@@ -1,0 +1,113 @@
+.\"
+.\" Copyright 2009  Morgan Stanley and Co. Incorporated
+.\"
+.\" Permission is hereby granted, free of charge, to any person obtaining
+.\" a copy of this software and associated documentation files (the
+.\" "Software"), to deal in the Software without restriction, including
+.\" without limitation the rights to use, copy, modify, merge, publish,
+.\" distribute, sublicense, and/or sell copies of the Software, and to
+.\" permit persons to whom the Software is furnished to do so, subject
+.\" to the following conditions:
+.\"
+.\" The above copyright notice and this permission notice shall be
+.\" included in all copies or substantial portions of the Software.
+.\"
+.\" THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+.\" EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+.\" MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+.\" IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR
+.\" ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+.\" CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+.\" WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+.\"
+.\" Blame: Roland Dowdeswell <rcd@metzdowd.com>
+.Dd January 25, 2005
+.Os
+.Dt K5PING 8
+.Sh NAME
+.Nm k5ping
+.Nd kerberos server ping utility
+.Sh SYNOPSIS
+.Nm
+.Op Fl 459tuv
+.Op Fl n Ar num
+.Op Fl p Ar princ
+.Op Fl P Ar pass
+.Op Fl S Ar sprinc
+.Ar kdc
+.Op Ar kdc Ar ...
+.Sh DESCRIPTION
+.Nm
+tests various operations against each of the KDCs on the command line.
+By default,
+.Nm
+will perform the follow list of actions:
+.Pp
+.Bl -enum -width indent
+.It
+Authenticate to Kerberos 5 via TCP,
+.It
+Use the resulting credential to request a service ticket for
+.Ar sprinc ,
+.It
+Authenticate to Kerberos 5 via UDP,
+.It
+Use the resulting credential to request a service ticket for
+.Ar sprinc ,
+.It
+Use the credential from the last Kerberos 5 AS_REQ
+to request a Kerberos IV ticket for
+.Ar sprinc ,
+via the krb524 service,
+.It
+Authenticate to Kerberos IV, and use the credential to
+request a service ticket for
+.Ar sprinc .
+.El
+.Pp
+By default
+.Nm
+will test Kerberos 5 TCP/UDP and Kerberos 524, but not Kerberos IV as its
+use has been deprecated.
+.Pp
+This is useful for quickly verifying the health of a kerberos server,
+and is suitable for inclusion in shell/perl scripts that check out
+the sanity of the Kerberos 5 world.
+.Pp
+The options are as follows:
+.Bl -tag -width indentxxx
+.It Fl 4
+Test Kerberos IV.
+.It Fl 5
+Test Kerberos 5.
+.It Fl 9
+Test krb524.
+.It Fl n Ar num
+Loop over the test
+.Ar num
+times.
+.It Fl P Ar pass
+The password for the client principal.
+.It Fl p Ar princ
+Client principal.
+.It Fl S Ar sprinc
+The service principal.
+.It Fl t
+Use TCP when testing Kerberos 5.
+.It Fl u
+Use UDP when testing Kerberos 5.
+.It Fl v
+Increment verbose level.  May be specified more than once.
+.El
+.Sh SEE ALSO
+.Xr kinit 1 ,
+.Xr krb524init 1 , and
+.Xr kvno 1 .
+.Sh BUGS
+.Ar Princ
+and
+.Ar sprinc
+must be in the same realm.
+.Pp
+If Kerberos IV is used, then temporary files are used in
+.Pa /tmp .
