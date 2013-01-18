@@ -2,6 +2,7 @@
 
 /*-
  * Copyright 2009  Morgan Stanley and Co. Incorporated
+ * Copyright 2013  Roland C. Dowdeswell
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -33,15 +34,11 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
-/* begin - for solaris 2.5.1 */
-#include <netinet/in.h>
-/* XXXrcd: this next one is _horrible_, but seems to work... */
-#define inline
-/* end   - for solaris 2.5.1 */
+#include <krb5.h>
 
-#include <k5-int.h>
+#ifdef HAVE_KRB4
 #include <kerberosIV/krb.h>
-#include <kapi.h>
+#endif
 
 /*
  * Prototypes.
@@ -50,17 +47,19 @@
 static void	usage(void);
 static void	fail_msg(const char *, int, const char *, const char *);
 static void	parse_kdc(const char *host);
-static int	kvno4(k_context, const char *, krb5_principal);
-static int	kvno5(k_context, const char *, int, krb5_principal,
-		      krb5_principal);
-static int	k5ping(k_context, const char *, int, krb5_principal,
-		       const char *, krb5_principal);
-static int	k4ping(k_context, const char *, krb5_principal, const char *,
+static int	kvno4(krb5_context, const char *, krb5_principal);
+static int	kvno5(krb5_context, const char *, int, krb5_principal,
+		      krb5_principal, krb5_ccache);
+static int	k5ping(krb5_context, const char *, int, krb5_principal,
+		       int, const char *, krb5_principal);
+#ifdef HAVE_KRB4
+static int	k4ping(krb5_context, const char *, krb5_principal, const char *,
 		       krb5_principal);
-static int	k524ping(k_context, const char *, const char *);
+static int	k524ping(krb5_context, const char *, const char *);
+#endif
 
 /*
- * Macros.
+ * Macros.  These can be set at each individual site.
  */
 
 #define PING_PRINC	"k5ping_princ"
@@ -85,12 +84,70 @@ int	verbose = 0;
 
 #define VERBOSE(x,y)	if (verbose >= (x)) fprintf y
 
+#define K5BAIL_DECLS							\
+		krb5_error_code	kret;					\
+		char croakstr[2048];
+
+#define BAIL(x, y)	do {						\
+		kret = x;						\
+		if (kret) {						\
+			snprintf(croakstr, sizeof(croakstr),		\
+			    "%s: %s", #x, y);				\
+			kret = 1;					\
+			goto done;					\
+		}							\
+	} while (0)
+
+#ifdef HAVE_HEIMDAL
+#define K5BAIL(x)	do {						\
+		kret = x;						\
+		if (kret) {						\
+			const char	*tmp;				\
+									\
+			tmp = krb5_get_error_message(ctx, kret);	\
+			if (tmp) {					\
+				snprintf(croakstr, sizeof(croakstr),	\
+				    "%s: %s", #x, tmp);			\
+				krb5_free_error_message(ctx, tmp);	\
+			} else {					\
+				snprintf(croakstr, sizeof(croakstr),	\
+				    "%s: unknown error", #x);		\
+			}						\
+			kret = 1;					\
+			goto done;					\
+		}							\
+	} while (0)
+#else	
+#define K5BAIL(x)	BAIL(x, error_message(kret))
+#endif
+
+
 /*
  * We over-ride the krb5_locate_kdc() function from -lkrb5 so that
  * we control both the horizontal and the verticle when it comes to
  * choosing which KDCs will be used.  As of MIT Kerberos 1.3, this
- * function takes socktype and family arguments.
+ * function takes socktype and family arguments.  We have two styles
+ * here at the moment: ``OLD_MIT'' should work with 1.3-1.9 or so.
+ * The default style should work with 1.10 and 1.11.
  */
+
+#ifdef OLD_MIT	/* XXXrcd: need to define what versions. */
+/* N.B.: You need to include fake-addrinfo.h *before* k5-int.h if you're
+   going to use this structure.  */
+struct addrlist {
+    struct {
+#ifdef FAI_DEFINED
+        struct addrinfo *ai;
+#else
+        struct undefined_addrinfo *ai;
+#endif
+        void (*freefn)(void *);
+        void *data;
+    } *addrs;
+    size_t naddrs;
+    size_t space;
+};
+#define ADDRLIST_INIT { 0, 0, 0 }
 
 krb5_error_code
 krb5_locate_kdc(krb5_context context, const krb5_data *realm,
@@ -133,7 +190,75 @@ krb5_locate_kdc(krb5_context context, const krb5_data *realm,
 	*addrlist = al;
 	return 0;
 }
+#else
+/* A single server hostname or address. */
+struct server_entry {
+    char *hostname;             /* NULL -> use addrlen/addr instead */
+    int port;                   /* Used only if hostname set */
+    int socktype;               /* May be 0 for UDP/TCP if hostname set */
+    int family;                 /* May be 0 (aka AF_UNSPEC) if hostname set */
+    size_t addrlen;
+    struct sockaddr_storage addr;
+}; 
 
+/* A list of server hostnames/addresses. */
+struct serverlist {
+    struct server_entry *servers;
+    size_t nservers;
+};
+#define SERVERLIST_INIT { NULL, 0 }
+
+enum locate_service_type {
+    locate_service_kdc = 1,
+    locate_service_master_kdc, 
+    locate_service_kadmin,
+    locate_service_krb524,
+    locate_service_kpasswd
+}; 
+
+krb5_error_code
+k5_locate_server(krb5_context ctx, const krb5_data *realm,
+		 struct serverlist *serverlist, enum locate_service_type svc,
+		 int socktype)
+{
+	struct server_entry	*se;
+
+	VERBOSE(3, (stderr, "k5_locate_server(ctx, \"%s\", serverlist, "
+	    "%d, %d, %d ) called\n", realm->data, socktype));
+
+	/*
+	 * krb524d is always a udp service, so we if we are doing 524,
+	 * then we hardwire to SOCK_DGRAM.
+	 */
+
+	if (socktype != 0 && ((!force_udp && socktype != current_socktype) ||
+	    (force_udp && socktype != SOCK_DGRAM)))
+		return KRB5_REALM_CANT_RESOLVE;
+
+	VERBOSE(3, (stderr, "adding %s to the list...\n", current_kdc));
+
+	se = calloc(sizeof(*se), 1);
+	if (!se)
+		return ENOMEM;
+
+	se->hostname = strdup(current_kdc);
+	se->port = current_port;
+	se->socktype = current_socktype;
+	se->family = AF_UNSPEC;
+
+	serverlist->servers = se;
+	serverlist->nservers = 1;
+
+	if (!se->hostname) {
+		free(se);
+		return ENOMEM;
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef HAVE_KRB4
 /*
  * We also over-ride krb_get_krbhst() in the same way.
  */
@@ -153,6 +278,7 @@ krb_get_krbhst(char *host, const char *realm, int n)
 	strcpy(host, current_kdc);
 	return 0;
 }
+#endif
 
 /* This function sets global variables */
 static void
@@ -193,10 +319,10 @@ fail_msg(const char *type, int socktype, const char *host, const char *error)
 	    type, socktype == SOCK_DGRAM ? "udp" : "tcp", error);
 }
 
+#ifdef HAVE_KRB4
 static int
-kvno4(k_context ctx, const char *host, krb5_principal sprinc)
+kvno4(krb5_context ctx, const char *host, krb5_principal sprinc)
 {
-	krb5_context	kctx;
 	krb5_error_code	kerr;
 	KTEXT_ST	req;
 	CREDENTIALS	creds;
@@ -207,8 +333,7 @@ kvno4(k_context ctx, const char *host, krb5_principal sprinc)
 
 	VERBOSE(1, (stderr, "initiating kvno4/udp ping to %s\n", host));
 
-	kctx = k_get_krb5_context(ctx);
-	kerr = krb5_524_conv_principal(kctx, sprinc, name, instance, realm);
+	kerr = krb5_524_conv_principal(ctx, sprinc, name, instance, realm);
 	if (kerr) {
 		fail_msg("kvno4", SOCK_DGRAM, host, error_message(kerr));
 		goto bail;
@@ -230,30 +355,24 @@ bail:
 		fail_msg("kvno4", SOCK_DGRAM, host, krb_get_err_text(err));
 	return err;
 }
+#endif
 
 static int
-kvno5(k_context ctx, const char *host, int socktype, krb5_principal princ,
-    krb5_principal sprinc)
+kvno5(krb5_context ctx, const char *host, int socktype, krb5_principal princ,
+    krb5_principal sprinc, krb5_ccache ccache)
 {
-	krb5_context	 k5ctx;
 	krb5_error_code	 kerr = 0;
 	krb5_creds	 increds;
 	krb5_creds	*outcreds = NULL;
-	krb5_ccache	 ccache = NULL;
 	krb5_ticket	*ticket = NULL;
 
 	VERBOSE(1, (stderr, "initiating kvno5/%s ping to %s\n",
 	    socktype == SOCK_DGRAM ? "udp" : "tcp", host));
-	k5ctx = k_get_krb5_context(ctx);
-
-	kerr = krb5_cc_default(k5ctx, &ccache);
-	if (kerr)
-		goto bail;
 
 	memset(&increds, 0x0, sizeof(increds));
 	increds.client = princ;
 	increds.server = sprinc;
-	kerr = krb5_get_credentials(k5ctx, 0, ccache, &increds, &outcreds);
+	kerr = krb5_get_credentials(ctx, 0, ccache, &increds, &outcreds);
 	if (kerr)
 		goto bail;
 
@@ -267,22 +386,23 @@ bail:
 	if (kerr)
 		fail_msg("kvno5", socktype, host, error_message(kerr));
 	if (ticket)
-		krb5_free_ticket(k5ctx, ticket);
+		krb5_free_ticket(ctx, ticket);
 	if (outcreds)
-		krb5_free_creds(k5ctx, outcreds);
+		krb5_free_creds(ctx, outcreds);
 
-	krb5_cc_close(k5ctx, ccache);
 	return kerr;
 }
 
 static int
-k5ping(k_context ctx, const char *host, int socktype, krb5_principal princ,
-    const char *passwd, krb5_principal sprinc)
+k5ping(krb5_context ctx, const char *host, int socktype, krb5_principal princ,
+    int use_kt, const char *passwd, krb5_principal sprinc)
 {
-	krb5_error_code	 kerr;
-	int		 err;
-	char		*tprinc;
-	char		*tmp;
+	K5BAIL_DECLS;
+	krb5_error_code		 kerr;
+	krb5_ccache		 ccache = NULL;
+	krb5_keytab		 kt;
+	krb5_creds		 creds;
+	krb5_get_init_creds_opt	*opt = NULL;
 
 	VERBOSE(1, (stderr, "initiating kerberos5/%s ping to %s\n",
 	    socktype == SOCK_DGRAM ? "udp" : "tcp", host));
@@ -290,25 +410,41 @@ k5ping(k_context ctx, const char *host, int socktype, krb5_principal princ,
 	parse_kdc(host);
 	current_socktype = socktype;
 
-	kerr = krb5_unparse_name(k_get_krb5_context(ctx), princ, &tprinc);
-	if (kerr) {
-		fail_msg("kerberos5", socktype, host, error_message(kerr));
-		return kerr;
+	K5BAIL(krb5_cc_resolve(ctx, "MEMORY:k5ping", &ccache));
+
+        K5BAIL(krb5_get_init_creds_opt_alloc(ctx, &opt));
+        krb5_get_init_creds_opt_set_tkt_life(opt, 15 * 60);
+
+	if (use_kt) {
+		K5BAIL(krb5_kt_default(ctx, &kt));
+		K5BAIL(krb5_get_init_creds_keytab(ctx, &creds, princ, kt, 0,
+		    NULL, opt));
+	} else {
+		K5BAIL(krb5_get_init_creds_password(ctx, &creds, princ, passwd,
+		    krb5_prompter_posix, NULL, 0, NULL, opt));
 	}
-	err = k_login(ctx, tprinc, passwd, NULL, 3600, 0, K_OPT_NONE);
-	krb5_free_unparsed_name(k_get_krb5_context(ctx), tprinc);
-	if (err) {
-		fail_msg("kerberos5", socktype, host, k_error_string(ctx));
-		return err;
-	}
-	return kvno5(ctx, host, socktype, princ, sprinc);
+
+	K5BAIL(krb5_cc_store_cred(ctx, ccache, &creds));
+
+	kret = kvno5(ctx, host, socktype, princ, sprinc, ccache);
+done:
+	if (ccache)
+		krb5_cc_destroy(ctx, ccache);
+
+	/* XXXrcd: free a few more things here... */
+	/*	   opt.  creds.                   */
+
+	if (croakstr[0])
+		fail_msg("kerberos5", socktype, host, croakstr);
+
+	return kret;
 }
 
+#if HAVE_KRB4
 static int
-k4ping(k_context ctx, const char *host, krb5_principal princ,
+k4ping(krb5_context ctx, const char *host, krb5_principal princ,
     const char *passwd, krb5_principal sprinc)
 {
-	krb5_context	kctx;
 	krb5_error_code	kerr;
 	int		ret;
 	char		name[ANAME_SZ];
@@ -317,8 +453,7 @@ k4ping(k_context ctx, const char *host, krb5_principal princ,
 
 	VERBOSE(1, (stderr, "initiating kerberos4/udp ping to %s\n", host));
 	parse_kdc(host);
-	kctx = k_get_krb5_context(ctx);
-	kerr = krb5_524_conv_principal(kctx, princ, name, instance, realm);
+	kerr = krb5_524_conv_principal(ctx, princ, name, instance, realm);
 	if (kerr) {
 		fail_msg("kerberos4", SOCK_DGRAM, host, error_message(kerr));
 		ret = 1;
@@ -332,6 +467,7 @@ k4ping(k_context ctx, const char *host, krb5_principal princ,
 		goto bail;
 	}
 	ret = kvno4(ctx, host, sprinc);
+	/* XXXrcd */
 	k_logout_k4(ctx, NULL, K_OPT_NONE);
 
 bail:
@@ -339,9 +475,8 @@ bail:
 }
 
 static int
-k524ping(k_context ctx, const char *host, const char *tsprinc)
+k524ping(krb5_context ctx, const char *host, const char *tsprinc)
 {
-	krb5_context	 kctx;
 	krb5_principal	 sprinc = NULL;
 	CREDENTIALS	 v4creds;
 	int		 kret;
@@ -355,8 +490,7 @@ k524ping(k_context ctx, const char *host, const char *tsprinc)
 	 * sprinc...
 	 */
 
-	kctx = k_get_krb5_context(ctx);
-	kret = krb5_parse_name(kctx, tsprinc, &sprinc);
+	kret = krb5_parse_name(ctx, tsprinc, &sprinc);
 	if (kret) {
 		fprintf(stderr, "malformed princ %s: %s\n", tsprinc,
 		    error_message(kret));
@@ -373,19 +507,19 @@ k524ping(k_context ctx, const char *host, const char *tsprinc)
 
 bail:
 #if 0
-	krb5_free_principal(kctx, sprinc);
+	krb5_free_principal(ctx, sprinc);
 #endif
 	return kret;
 }
+#endif
 
 int
 main(int argc, char **argv)
 {
-	k_context	 ctx;
-	krb5_context	 kctx;
+	K5BAIL_DECLS;
+	krb5_context	 ctx;
 	krb5_principal	 princ;
 	krb5_principal	 sprinc;
-	krb5_error_code	 kret;
 	int		 ch;
 	int		 ret;
 	int		 do_tcp = 0;
@@ -394,6 +528,7 @@ main(int argc, char **argv)
 	int		 do_v5 = 0;
 	int		 do_524 = 0;
 	int		 times = 1;
+	int		 use_kt = 0;
 	char		 v4_ticket_file[128];
 	char		*passwd = NULL;
 	char		*tprinc = NULL;
@@ -405,7 +540,7 @@ main(int argc, char **argv)
 	else
 		progname = argv[0];
 
-	while ((ch = getopt(argc, argv, "459P:S:n:p:tuv")) != -1)
+	while ((ch = getopt(argc, argv, "459P:S:kn:p:tuv")) != -1)
 		switch (ch) {
 		case '4':
 			do_v4 = 1;
@@ -423,6 +558,9 @@ main(int argc, char **argv)
 		case 'S':
 			free(tsprinc);
 			tsprinc = strdup(optarg);
+			break;
+		case 'k':
+			use_kt = 1;
 			break;
 		case 'n':
 			times = atoi(optarg);
@@ -446,15 +584,37 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
+	/* Check sanity */
+
+	if (passwd && use_kt) {
+		fprintf(stderr, "Cannot use both passwd and keytab.\n");
+		exit(1);
+	}
+
+#ifdef HAVE_KRB4
+	if (do_v4 && use_kt) {
+		fprintf(stderr, "Cannot use keytab with Kerberos IV.\n");
+		exit(1);
+	}
+#endif
+
+#ifndef HAVE_KRB4
+	if (do_v4 || do_524) {
+		fprintf(stderr, "Kerberos IV unsupported in this "
+		    "implementation.\n");
+		exit(1);
+	}
+#endif
+
 	/* Fill in default values */
 
 	if (!tprinc)
 		tprinc = strdup(PING_PRINC);
 	if (!tsprinc)
 		tsprinc = strdup(PING_SPRINC);
-	if (!passwd)
+	if (!use_kt && !passwd)
 		passwd = strdup(PING_PASSWD);
-	if (!*passwd) {	/* on empty passwds we prompt for it */
+	if (!use_kt && !*passwd) {    /* on empty passwds we prompt for it */
 		passwd = getpass("Password:");
 	}
 
@@ -465,35 +625,19 @@ main(int argc, char **argv)
 	if (do_524)
 		do_v5 = 1;
 
-	if (k_init_ctx(&ctx, progname, K_OPT_NONE)) {
-		fprintf(stderr, "k5ping ERROR - unable to initalize kapi "
-		    "context\n");
-		exit(1);
-	}
+	K5BAIL(krb5_init_context(&ctx));
+	K5BAIL(krb5_parse_name(ctx, tprinc, &princ));
+	K5BAIL(krb5_parse_name(ctx, tsprinc, &sprinc));
 
-	sprintf(v4_ticket_file, "/tmp/k5ping_tkt4_%d_%d", getpid(), getuid());
-
-	k_set_default_cache(ctx, "MEMORY:k5ping");
-	k_set_default_cache_k4(ctx, v4_ticket_file);
-
-	/* XXXrcd: put error checking here... */
-	kctx = k_get_krb5_context(ctx);
-	kret = krb5_parse_name(kctx, tprinc, &princ);
-	if (kret) {
-		fprintf(stderr, "malformed princ %s: %s\n", tprinc,
-		    error_message(kret));
-		exit(127);
-	}
-	kret = krb5_parse_name(kctx, tsprinc, &sprinc);
-	if (kret) {
-		fprintf(stderr, "malformed princ %s: %s\n", tsprinc,
-		    error_message(kret));
-		exit(127);
-	}
 	free(tprinc);
 	free(tsprinc);
-	krb5_unparse_name(kctx, princ, &tprinc);
-	krb5_unparse_name(kctx, sprinc, &tsprinc);
+	krb5_unparse_name(ctx, princ, &tprinc);
+	krb5_unparse_name(ctx, sprinc, &tsprinc);
+
+#ifdef HAVE_KRB4
+	sprintf(v4_ticket_file, "/tmp/k5ping_tkt4_%d_%d", getpid(), getuid());
+	k_set_default_cache_k4(ctx, v4_ticket_file);
+#endif
 
 	VERBOSE(1, (stderr, "princ: %s\nsprinc: %s\n", tprinc, tsprinc));
 
@@ -503,15 +647,16 @@ main(int argc, char **argv)
 		ret = 0;
 		for (i=0; argv[i]; i++) {
 			if (do_v5 && do_tcp && k5ping(ctx, argv[i], SOCK_STREAM,
-			    princ, passwd, sprinc)) {
+			    princ, use_kt, passwd, sprinc)) {
 				ret++;
 				continue;
 			}
 			if (do_v5 && do_udp && k5ping(ctx, argv[i], SOCK_DGRAM,
-			    princ, passwd, sprinc)) {
+			    princ, use_kt, passwd, sprinc)) {
 				ret++;
 				continue;
 			}
+#ifdef HAVE_KRB4
 			if (do_524 && k524ping(ctx, argv[i], tsprinc)) {
 				ret++;
 				continue;
@@ -521,11 +666,15 @@ main(int argc, char **argv)
 				ret++;
 				continue;
 			}
+#endif
 			if (times == 0)
 				printf("k5ping(%s): successful\n", argv[i]);
 		}
 	}
 
-	k_close_ctx(ctx);
+done:
+	if (croakstr[0])
+		fprintf(stderr, "FATAL: %s\n", croakstr);
+
 	exit(ret);
 }

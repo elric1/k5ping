@@ -29,7 +29,7 @@
 .Nd kerberos server ping utility
 .Sh SYNOPSIS
 .Nm
-.Op Fl 459tuv
+.Op Fl 459ktuv
 .Op Fl n Ar num
 .Op Fl p Ar princ
 .Op Fl P Ar pass
@@ -82,6 +82,8 @@ Test Kerberos IV.
 Test Kerberos 5.
 .It Fl 9
 Test krb524.
+.It Fl k
+Use a keytab rather than a passwd.
 .It Fl n Ar num
 Loop over the test
 .Ar num
