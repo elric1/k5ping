@@ -86,7 +86,7 @@ int	verbose = 0;
 
 #define K5BAIL_DECLS							\
 		krb5_error_code	kret;					\
-		char croakstr[2048];
+		char croakstr[2048] = "";
 
 #define BAIL(x, y)	do {						\
 		kret = x;						\
@@ -132,62 +132,87 @@ int	verbose = 0;
  */
 
 #ifdef OLD_MIT	/* XXXrcd: need to define what versions. */
-/* N.B.: You need to include fake-addrinfo.h *before* k5-int.h if you're
-   going to use this structure.  */
-struct addrlist {
-    struct {
-#ifdef FAI_DEFINED
-        struct addrinfo *ai;
-#else
-        struct undefined_addrinfo *ai;
-#endif
-        void (*freefn)(void *);
-        void *data;
-    } *addrs;
-    size_t naddrs;
-    size_t space;
+
+struct addrs {
+	struct addrinfo *ai;
+	void (*freefn)(void *);
+	void *data;
 };
-#define ADDRLIST_INIT { 0, 0, 0 }
+
+struct addrlist {
+	struct addrs *addrs;
+	size_t naddrs;
+	size_t space;
+};
 
 krb5_error_code
-krb5_locate_kdc(krb5_context context, const krb5_data *realm,
-                struct addrlist *addrlist,
-                int get_masters, int socktype, int family)
+krb5_locate_kdc(krb5_context ctx, const krb5_data *realm,
+                struct addrlist *addrlist, int get_masters,
+		int socktype, int family)
 {
-	krb5_error_code	ret;
-	struct addrlist	al = ADDRLIST_INIT;
-
-	*addrlist = al;
+	krb5_error_code	 ret;
+	struct addrinfo	*addrs;
+	struct addrinfo	*a;
+	struct addrinfo	 hint;
+	struct addrs	*al_addrs;
+	char		 portbuf[16];
+	size_t		 num;
+	int		 err;
 
 	VERBOSE(3, (stderr, "krb5_locate_kdc(context, \"%s\", addrlist, "
 	    "%d, %d, %d ) called\n", realm->data, get_masters, socktype,
 	    family));
+
+	memset(addrlist, 0x0, sizeof(*addrlist));
 
 	/*
 	 * krb524d is always a udp service, so we if we are doing 524,
 	 * then we hardwire to SOCK_DGRAM.
 	 */
 
-	if ((!force_udp && socktype != current_socktype) ||
-	    ( force_udp && socktype != SOCK_DGRAM))
+	if (socktype != 0 && ((!force_udp && socktype != current_socktype) ||
+	    (force_udp && socktype != SOCK_DGRAM)))
 		return KRB5_REALM_CANT_RESOLVE;
 
-	VERBOSE(3, (stderr, "adding %s to the list...\n", current_kdc));
-	ret = krb5int_add_host_to_list(&al, current_kdc, current_port,
-	    current_secport, socktype, family);
+	memset(&hint, 0, sizeof(hint));
+	hint.ai_family = family;
+	hint.ai_socktype = socktype;
+#ifdef AI_NUMERICSERV
+	hint.ai_flags = AI_NUMERICSERV;
+#endif
 
-	VERBOSE(3, (stderr, "krb5int_add_host_to_list returns %d\n", ret));
+	snprintf(portbuf, sizeof(portbuf), "%d", ntohs(current_port));
+	/* XXXrcd: errors... */
 
-	/* XXXrcd: should free space on errors, apparently */
-	if (ret)
-		return ret;
-
-	VERBOSE(4, (stderr, "we have %d addresses\n", al.naddrs));
-
-	if (!al.naddrs)
+	err = getaddrinfo(current_kdc, portbuf, &hint, &addrs);
+	if (err) {
+		fprintf(stderr, "can't resolve %s:%s: %s\n",
+		    current_kdc, portbuf, gai_strerror(err));
 		return KRB5_REALM_CANT_RESOLVE;
+	}
 
-	*addrlist = al;
+	for (num=0, a=addrs; a; a=a->ai_next, num++)
+		;
+
+	al_addrs = calloc(sizeof(*al_addrs) * num, 1);
+	/* XXXrcd: errors... */
+
+	for (num=0, a=addrs; a; a=a->ai_next, num++) {
+		al_addrs[num].ai     = a;
+		if (num == 0) {
+			al_addrs[num].freefn = freeaddrinfo;
+			al_addrs[num].data   = a;
+		}
+	}
+
+	(*addrlist).addrs  = al_addrs;
+	(*addrlist).naddrs = num;
+	(*addrlist).space  = num;
+
+	VERBOSE(3, (stderr, "krb5_locate_kdc(context, \"%s\", addrlist, "
+	    "%d, %d, %d ) returning %d address(es)\n", realm->data,
+	    get_masters, socktype, family, num));
+
 	return 0;
 }
 #else
